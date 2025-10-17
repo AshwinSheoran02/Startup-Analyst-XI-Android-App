@@ -89,7 +89,11 @@ public class MainActivity extends AppCompatActivity {
         // JS bridge to handle blob: downloads
         webview.addJavascriptInterface(new DownloadBridge(), "AndroidDownloader");
         webview.setOverScrollMode(WebView.OVER_SCROLL_NEVER);
-        webview.loadUrl(websiteURL);
+        // Load initial URL or deep link if provided
+        Intent launchIntent = getIntent();
+        if (!handleDeepLinkIfPresent(launchIntent)) {
+            webview.loadUrl(websiteURL);
+        }
         webview.setWebViewClient(new WebViewClientDemo());
 
         // Handle <input type="file"> from the website
@@ -230,6 +234,46 @@ public class MainActivity extends AppCompatActivity {
         });
 
     }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleDeepLinkIfPresent(intent);
+    }
+
+    private boolean handleDeepLinkIfPresent(Intent intent) {
+        if (intent == null || webview == null) return false;
+        Uri data = intent.getData();
+        if (data == null) return false;
+
+        // If it's our custom scheme, translate to the HTTPS completion path
+        if ("startupanalystxi".equalsIgnoreCase(data.getScheme())) {
+            // Example: startupanalystxi://auth/mobile-auth-complete?token=XYZ
+            String host = data.getHost() != null ? data.getHost() : "";
+            String path = data.getPath() != null ? data.getPath() : "";
+            Uri.Builder b = new Uri.Builder()
+                    .scheme("https")
+                    .authority("startup-analyst-xi.vercel.app");
+            if (!path.isEmpty()) b.appendEncodedPath(path.replaceFirst("^/", ""));
+            for (String name : data.getQueryParameterNames()) {
+                b.appendQueryParameter(name, data.getQueryParameter(name));
+            }
+            Uri httpsTarget = b.build();
+            webview.loadUrl(httpsTarget.toString());
+            return true;
+        }
+
+        // If it's already https for our domain, load as-is
+        if ("https".equalsIgnoreCase(data.getScheme())) {
+            String host = data.getHost() != null ? data.getHost() : "";
+            if (host.equalsIgnoreCase("startup-analyst-xi.vercel.app")) {
+                webview.loadUrl(data.toString());
+                return true;
+            }
+        }
+        return false;
+    }
     private void setupFileUploadSupport() {
         // Register Activity Result for file chooser
         fileChooserLauncher = registerForActivityResult(
@@ -301,6 +345,41 @@ public class MainActivity extends AppCompatActivity {
                     MainActivity.this.filePathCallback = null;
                     return false;
                 }
+                return true;
+            }
+
+            @Override
+            public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, android.os.Message resultMsg) {
+                // Try to get URL from hit test result first
+                WebView.HitTestResult result = view.getHitTestResult();
+                String url = result != null ? result.getExtra() : null;
+                if (url != null) {
+                    try {
+                        Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+                        intent.addCategory(Intent.CATEGORY_BROWSABLE);
+                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                        view.getContext().startActivity(intent);
+                        return true;
+                    } catch (Throwable ignored) {}
+                }
+
+                // Fallback: create a transient WebView to capture the first URL and open externally
+                WebView temp = new WebView(view.getContext());
+                temp.setWebViewClient(new WebViewClient() {
+                    @Override
+                    public boolean shouldOverrideUrlLoading(WebView v, String u) {
+                        try {
+                            Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(u));
+                            i.addCategory(Intent.CATEGORY_BROWSABLE);
+                            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                            v.getContext().startActivity(i);
+                        } catch (Throwable ignored) {}
+                        return true;
+                    }
+                });
+                WebView.WebViewTransport transport = (WebView.WebViewTransport) resultMsg.obj;
+                transport.setWebView(temp);
+                resultMsg.sendToTarget();
                 return true;
             }
         });
@@ -377,11 +456,98 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private class WebViewClientDemo extends WebViewClient {
+        private boolean isSiteAuthEntryUrl(String url) {
+            if (url == null) return false;
+            try {
+                Uri u = Uri.parse(url);
+                Uri base = Uri.parse(websiteURL);
+                String host = u.getHost() != null ? u.getHost().toLowerCase() : "";
+                String baseHost = base.getHost() != null ? base.getHost().toLowerCase() : "";
+                if (!host.equals(baseHost)) return false;
+                String path = u.getPath() != null ? u.getPath().toLowerCase() : "";
+                // Common web auth entry points for Next.js/NextAuth/custom endpoints
+                if (path.startsWith("/api/auth/signin")) return true; // NextAuth
+                if (path.contains("/auth/google")) return true;       // Custom Google entry
+                if (path.contains("/oauth")) return true;             // Generic oauth endpoints
+                if (path.equals("/login") || path.equals("/signin")) return true; // Login pages
+            } catch (Throwable ignored) {}
+            return false;
+        }
+        private boolean isGoogleOAuthUrl(String url) {
+            if (url == null) return false;
+            try {
+                Uri uri = Uri.parse(url);
+                String host = uri.getHost() != null ? uri.getHost().toLowerCase() : "";
+                // Common Google Identity/OAuth endpoints
+                if (host.endsWith("accounts.google.com")) return true;
+                if (host.endsWith("oauth2.googleapis.com")) return true;
+                if (host.endsWith("identitytoolkit.googleapis.com")) return true;
+            } catch (Throwable ignored) {}
+            return false;
+        }
+
+        private void openInDefaultBrowser(Context ctx, String url) {
+            try {
+                Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+                intent.addCategory(Intent.CATEGORY_BROWSABLE);
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                ctx.startActivity(intent);
+            } catch (ActivityNotFoundException e) {
+                Toast.makeText(ctx, "No browser available to handle sign-in.", Toast.LENGTH_LONG).show();
+            }
+        }
+
         @Override
-        //Keep webview in app when clicking links
         public boolean shouldOverrideUrlLoading(WebView view, String url) {
+            // If user taps your site's sign-in entry URL, start the flow in the browser
+            if (isSiteAuthEntryUrl(url)) {
+                // Append a hint so your backend can bounce back to the app without extra detection logic
+                try {
+                    Uri u = Uri.parse(url);
+                    Uri.Builder b = u.buildUpon();
+                    // Don't duplicate if already present
+                    if (u.getQueryParameter("app_redirect") == null) {
+                        b.appendQueryParameter("app_redirect", "startupanalystxi://auth/mobile-auth-complete");
+                    }
+                    url = b.build().toString();
+                } catch (Throwable ignored) {}
+                openInDefaultBrowser(view.getContext(), url);
+                return true;
+            }
+            // If this looks like a Google OAuth/Sign-In URL, open in the default browser
+            if (isGoogleOAuthUrl(url) || (url != null && url.startsWith("intent://"))) {
+                // Try to resolve intent:// links as well
+                if (url != null && url.startsWith("intent://")) {
+                    try {
+                        Intent intent = Intent.parseUri(url, Intent.URI_INTENT_SCHEME);
+                        if (intent != null) {
+                            intent.addCategory(Intent.CATEGORY_BROWSABLE);
+                            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                            // If the app is not installed, fall back to browser via fallback URL
+                            if (intent.getPackage() != null) {
+                                try { getPackageManager().getPackageInfo(intent.getPackage(), 0); } catch (Exception ignore) { intent.setPackage(null); }
+                            }
+                            if (intent.getData() == null) {
+                                String fallbackUrl = intent.getStringExtra("browser_fallback_url");
+                                if (fallbackUrl != null) intent.setData(Uri.parse(fallbackUrl));
+                            }
+                            startActivity(intent);
+                            return true;
+                        }
+                    } catch (Exception ignored) {}
+                }
+                openInDefaultBrowser(view.getContext(), url);
+                return true;
+            }
+
             view.loadUrl(url);
             return true;
+        }
+
+        @Override
+        public boolean shouldOverrideUrlLoading(WebView view, android.webkit.WebResourceRequest request) {
+            String url = request != null && request.getUrl() != null ? request.getUrl().toString() : null;
+            return shouldOverrideUrlLoading(view, url);
         }
         @Override
         public void onPageFinished(WebView view, String url) {

@@ -27,6 +27,25 @@
 
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Handle links to your site so browser-based sign-in redirects open back in the app -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="https"
+                    android:host="startup-analyst-xi.vercel.app" />
+            </intent-filter>
+
+            <!-- Fallback custom scheme to guarantee opening the app even if App Links aren't verified -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="startupanalystxi"
+                    android:host="auth" />
+            </intent-filter>
         </activity>
 
         <receiver
